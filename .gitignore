@@ -1,0 +1,14 @@
+node_modules
+dist
+.DS_Store
+*.log
+coverage
+.env
+.env.*
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+# App-specific
+app/node_modules
+app/dist
+docs/.cache
