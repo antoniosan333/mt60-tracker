@@ -11,22 +11,35 @@ import {
   seedTodayFromYesterdayIfEmpty,
   startNewProgram,
 } from './logic';
-import { loadState, saveState } from './storage';
+import { loadState, saveState, migrateLocalToRemoteIfNeeded, tryLoadRemoteState, trySaveRemoteState } from './storage';
+import { getDisplayName, setDisplayName, upsertDailyLog } from './remote';
+import supabase from './supabaseClient';
+import AuthScreen from './Auth';
 import './index.css';
 
 type Tab = 'today' | 'evening' | 'history' | 'settings';
 
-function useProgramState(): [ProgramState, (updater: (s: ProgramState) => void) => void] {
+function useProgramState(userId?: string | null): [ProgramState, (updater: (s: ProgramState) => void) => void, (s: ProgramState) => void] {
   const [state, setState] = useState<ProgramState>(() => loadState());
+  const replace = (next: ProgramState) => {
+    setState(next);
+    saveState(next);
+    if (userId) {
+      void trySaveRemoteState(userId, next);
+    }
+  };
   const update = (updater: (s: ProgramState) => void) => {
     setState((prev) => {
       const clone: ProgramState = JSON.parse(JSON.stringify(prev));
       updater(clone);
       saveState(clone);
+      if (userId) {
+        void trySaveRemoteState(userId, clone);
+      }
       return clone;
     });
   };
-  return [state, update];
+  return [state, update, replace];
 }
 
 function Header({ dayNumber }: { dayNumber: number }) {
@@ -276,15 +289,50 @@ function HistoryTab({
   );
 }
 
-function SettingsTab({
-  onReset,
-}: {
+function SettingsTab({ onReset, displayName, onChangeDisplayName, onSaveDisplayName, onChangePassword, onSignOut }: {
   onReset: () => void;
+  displayName?: string;
+  onChangeDisplayName: (v: string) => void;
+  onSaveDisplayName: () => void;
+  onChangePassword: (newPassword: string, confirm: string) => void;
+  onSignOut: () => void;
 }) {
+  const [name, setName] = useState(displayName ?? '');
+  const [pw1, setPw1] = useState('');
+  const [pw2, setPw2] = useState('');
   return (
     <div className="screen">
       <div className="card">
-        <h3>Settings</h3>
+        <h3>Profile</h3>
+        <div className="field">
+          <label>Display name</label>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Your name"
+            style={{ padding: 12, borderRadius: 10, border: '1px solid var(--border)', background: 'var(--input)', color: 'var(--text)' }}
+          />
+        </div>
+        <div className="row">
+          <button className="secondary" onClick={() => { onChangeDisplayName(name); onSaveDisplayName(); }}>Save</button>
+          <button className="secondary" onClick={onSignOut}>Sign out</button>
+        </div>
+      </div>
+      <div className="card">
+        <h3>Change password</h3>
+        <div className="field">
+          <label>New password</label>
+          <input type="password" value={pw1} onChange={(e) => setPw1(e.target.value)} style={{ padding: 12, borderRadius: 10, border: '1px solid var(--border)', background: 'var(--input)', color: 'var(--text)' }} />
+        </div>
+        <div className="field">
+          <label>Confirm password</label>
+          <input type="password" value={pw2} onChange={(e) => setPw2(e.target.value)} style={{ padding: 12, borderRadius: 10, border: '1px solid var(--border)', background: 'var(--input)', color: 'var(--text)' }} />
+        </div>
+        <button className="secondary" onClick={() => onChangePassword(pw1, pw2)}>Update password</button>
+      </div>
+      <div className="card">
+        <h3>Challenge</h3>
         <button className="danger" onClick={onReset}>Reset program</button>
         <p className="muted">This clears the current streak and starts Day 1 today. Past attempts history is kept.</p>
       </div>
@@ -293,10 +341,42 @@ function SettingsTab({
 }
 
 export default function App() {
-  const [state, update] = useProgramState();
+  const [session, setSession] = useState<import('@supabase/supabase-js').Session | null>(null);
+  const userId = session?.user?.id ?? null;
+  const [displayName, setDisplayNameState] = useState<string | undefined>(undefined);
+  const [state, update, replace] = useProgramState(userId);
   const [tab, setTab] = useState<Tab>('today');
   const [resetMessage, setResetMessage] = useState<string | undefined>();
   const todayKey = useMemo(() => dateKeyFromDate(new Date()), []);
+
+  // Auth session
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => {
+      setSession(sess);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // Load remote or migrate local after sign-in
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      const remote = await tryLoadRemoteState(userId);
+      let base = remote;
+      if (!base) {
+        base = await migrateLocalToRemoteIfNeeded(userId);
+      }
+      if (base) {
+        replace(base);
+      }
+      // Load profile/settings metadata
+      const name = await getDisplayName(userId);
+      setDisplayNameState(name);
+      // ignore user_settings for now; extend if app adds toggles later
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
 
   // Initialize or check resets and seeding
   useEffect(() => {
@@ -338,6 +418,10 @@ export default function App() {
         alert('🎉 60-day program complete! Congratulations!');
       }
     });
+    if (userId) {
+      const num = calculateDayNumber(state, new Date());
+      void upsertDailyLog(userId, todayKey, next, num);
+    }
   };
 
   const copyEveningToTomorrow = () => {
@@ -372,13 +456,37 @@ export default function App() {
     setTab('today');
   };
 
+  const onChangePassword = async (pw: string, confirm: string) => {
+    if (!pw || pw !== confirm) {
+      alert('Passwords do not match.');
+      return;
+    }
+    const { error } = await supabase.auth.updateUser({ password: pw });
+    if (error) alert(error.message);
+    else alert('Password updated.');
+  };
+
+  const onSignOut = async () => {
+    await supabase.auth.signOut();
+  };
+
+  const onSaveDisplay = async () => {
+    if (!userId) return;
+    await setDisplayName(userId, displayName ?? '');
+    alert('Saved.');
+  };
+
+  if (!session) {
+    return <AuthScreen />;
+  }
+
   if (!state.started) {
     return (
       <div className="start-screen">
         <h1>60-Day Mental Toughness</h1>
         <p>Tap Start to begin Day 1. Progress advances by calendar date.</p>
         <button className="primary big" onClick={handleStart}>Start Day 1</button>
-        <p className="muted small">No accounts. Your progress stays on this device (localStorage).</p>
+        <p className="muted small">You are signed in. Data syncs to your account.</p>
       </div>
     );
   }
@@ -408,7 +516,16 @@ export default function App() {
       {tab === 'history' && (
         <HistoryTab state={state} currentStartKey={state.startDate} todayKey={todayKey} />
       )}
-      {tab === 'settings' && <SettingsTab onReset={manualReset} />}
+      {tab === 'settings' && (
+        <SettingsTab
+          onReset={manualReset}
+          displayName={displayName}
+          onChangeDisplayName={setDisplayNameState}
+          onSaveDisplayName={onSaveDisplay}
+          onChangePassword={onChangePassword}
+          onSignOut={onSignOut}
+        />
+      )}
 
       {resetMessage && (
         <div className="toast" role="alert" onClick={() => setResetMessage(undefined)}>
