@@ -17,7 +17,7 @@ A single-user, mobile-first web app to track a 60-day mental toughness program. 
 
 ```bash
 cd app
-npm install
+npm ci
 npm run dev
 ```
 
@@ -45,6 +45,14 @@ npx serve app/dist
 # or
 python -m http.server -d app/dist 43124
 ```
+
+## GitHub Pages
+
+- Production (after merge to `main`): deployed automatically by GitHub Actions to Pages at:
+  - https://antoniosan333.github.io/mt60-tracker/
+- Pre-merge preview: this branch includes a committed static build in `docs/`. Point the repo’s Pages setting to "Deploy from a branch" → this branch → `/docs` to preview on a phone immediately.
+
+The app is PWA-safe under a subpath. `vite.config.ts` sets `base: './'`, `index.html` uses a relative favicon, the manifest has `start_url: "./"`, and the service worker registers with `./sw.js`, so assets resolve correctly at `/mt60-tracker/`.
 
 ## Tests
 Basic tests for day math and reset logic are included. Run:
